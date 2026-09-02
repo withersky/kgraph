@@ -1,0 +1,861 @@
+#!/usr/bin/env python3
+# kgraph — Knowledge graph (mcp-memory JSONL) -> interactive HTML visualizer.
+#
+# Copyright (C) 2026 withersky
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""Knowledge graph (mcp-memory JSONL) -> interactive HTML visualizer.
+
+Static : kgraph static <graph.jsonl> [-o | --open]     -> writes <graph>.html next to source.
+Serve  : kgraph serve <graph.jsonl> [-p N | --port N] [-no | --no-open] [-b]   live HTTP view, page auto-updates.
+         -b / --background   run as a daemon; several graphs may run at once
+                              (each takes the next free port starting from --port).
+List   : kgraph list (alias: ps)                  -> show running background servers.
+Stop   : kgraph stop <id|port|name> | --all       -> stop one server or all.
+Man    : kgraph man                                -> show this manual page.
+
+Author : withersky
+"""
+import argparse
+import hashlib
+import html
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import webbrowser
+from collections import Counter
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+PALETTE = [
+    "#4c9be8", "#e86a4c", "#4ce887", "#e8c44c", "#a04ce8",
+    "#4ce8d9", "#e84ca6", "#8a8de8", "#e88b4c", "#79c94a",
+]
+
+def _default_state_dir():
+    """State directory per OS (no external deps).
+
+    Linux:   $XDG_STATE_HOME/kgraph   (default ~/.local/state/kgraph)
+    macOS:   ~/Library/Application Support/kgraph
+    Windows: %LOCALAPPDATA%/kgraph    (default ~/AppData/Local/kgraph)
+    """
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+    return base / "kgraph"
+
+
+STATE_DIR = _default_state_dir()
+STATE_FILE = STATE_DIR / "servers.json"
+LOG_DIR = STATE_DIR / "logs"
+CONFIG_KEY = "_config"
+_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)  # Windows: SIGKILL нет, SIGTERM и так жёсткий
+
+
+def load_graph(path: Path):
+    """Parse an mcp-memory JSONL file into (entities, relations).
+
+    Robust to real-world MCP append behavior: records may be glued together
+    without newlines (`}{`) and the tail may be a partially written record.
+    Returns (entities, relations, incomplete: bool).
+    """
+    text = path.read_text(encoding="utf-8", errors="replace")
+    entities, relations, incomplete = [], [], False
+    decoder = json.JSONDecoder()
+    idx, n = 0, len(text)
+    while idx < n:
+        while idx < n and text[idx] in " \t\r\n":
+            idx += 1
+        if idx >= n:
+            break
+        try:
+            rec, idx = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            incomplete = True  # partially written record at the tail
+            break
+        if not isinstance(rec, dict) or "type" not in rec:
+            continue
+        (entities if rec["type"] == "entity" else relations).append(rec)
+    return entities, relations, incomplete
+
+
+def build_payload(entities, relations):
+    """Convert entities/relations into vis.js {nodes, edges, meta}."""
+    degree = Counter()
+    for r in relations:
+        degree[r.get("from", "")] += 1
+        degree[r.get("to", "")] += 1
+    max_deg = max(degree.values(), default=1)
+
+    type_colors = {}
+    for i, t in enumerate(dict.fromkeys(e.get("entityType", "other") for e in entities)):
+        type_colors[t] = PALETTE[i % len(PALETTE)]
+    rel_colors = {}
+    for i, t in enumerate(dict.fromkeys(r.get("relationType", "link") for r in relations)):
+        rel_colors[t] = PALETTE[(i + 5) % len(PALETTE)]
+
+    nodes = []
+    for e in entities:
+        obs = "<br>".join(f"&bull; {o}" for o in e.get("observations", []) if o)
+        nodes.append({
+            "id": e["name"], "label": e["name"],
+            "value": 10 + 40 * degree.get(e["name"], 1) / max_deg,
+            "color": type_colors.get(e.get("entityType", "other"), "#999"),
+            "entityType": e.get("entityType", "other"),
+            "title": f"<b>{e['name']}</b> <i>({e.get('entityType','')})</i><br>{obs}",
+            "shape": "dot", "font": {"size": 14},
+        })
+    edges = [
+        {"from": r["from"], "to": r["to"], "label": r.get("relationType", ""),
+         "arrows": "to",
+         "color": {"color": rel_colors.get(r.get("relationType", "link"), "#999"),
+                   "highlight": "#c00"},
+         "font": {"size": 11, "strokeWidth": 3, "strokeColor": "#ffffff"}}
+        for r in relations
+    ]
+    return {"nodes": nodes, "edges": edges,
+            "entityTypes": list(type_colors), "relationTypes": list(rel_colors)}
+
+
+def payload_signature(payload):
+    raw = json.dumps(payload["nodes"], ensure_ascii=False, sort_keys=True) + \
+          json.dumps(payload["edges"], ensure_ascii=False, sort_keys=True)
+    return hashlib.md5(raw.encode()).hexdigest()[:10]
+
+
+# ---------------- BACKGROUND STATE ----------------
+def _state_load():
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return state if isinstance(state, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _state_save(state):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _config_theme():
+    state = _state_load()
+    return state.get(CONFIG_KEY, {}).get("theme", "light")
+
+
+def _config_set_theme(theme):
+    state = _state_load()
+    state[CONFIG_KEY] = {"theme": theme}
+    _state_save(state)
+
+
+def _pid_alive(pid):
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        return _win_pid_alive(pid)
+    try:
+        os.kill(pid, 0)  # POSIX: сигнал 0 только проверяет существование
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _win_pid_alive(pid):
+    """Windows: os.kill(pid, 0) убил бы процесс, поэтому проверяем через OpenProcess."""
+    import ctypes
+    from ctypes import wintypes
+    STILL_ACTIVE = 259
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    k32 = ctypes.windll.kernel32
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    try:
+        code = wintypes.DWORD()
+        if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True  # не смогли опросить — считаем живым
+        return code.value == STILL_ACTIVE
+    finally:
+        k32.CloseHandle(handle)
+
+
+def _remove_log(sid):
+    try:
+        (LOG_DIR / f"{sid}.log").unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _prune(state):
+    dead = [k for k, v in state.items() if k != CONFIG_KEY and not _pid_alive(v.get("pid", -1))]
+    for k in dead:
+        del state[k]
+        _remove_log(k)
+    return state
+
+
+def _pick_port(wanted):
+    for port in range(wanted, wanted + 200):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    sys.exit("Не нашёл свободного порта")
+
+
+def _kill_pid(pid):
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    for _ in range(40):
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.05)
+    try:
+        os.kill(pid, _SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+# ---------------- STATIC MODE ----------------
+def cmd_static(args):
+    src = Path(args.graph)
+    if not src.exists():
+        sys.exit(f"Файл не найден: {src}")
+    entities, relations, incomplete = load_graph(src)
+    payload = build_payload(entities, relations)
+    out = src.with_suffix(".html") if src.suffix else Path(str(src) + ".html")
+    out.write_text(render_html(payload, page_title=f"Kgraph - {src.name}",
+                               page_header=f"Knowledge Graph — {str(src.resolve())}",
+                               theme=_config_theme()),
+                   encoding="utf-8")
+    note = " (файл дописывается — данные могут быть неполными)" if incomplete else ""
+    print(f"OK: {out}  ({len(entities)} entities, {len(relations)} relations, {out.stat().st_size // 1024} KB{note})")
+    if args.open:
+        webbrowser.open(out.resolve().as_uri())
+
+
+# ---------------- LIVE MODE ----------------
+class GraphHandler(BaseHTTPRequestHandler):
+    graph_path = None
+    last_mtime = 0.0
+    cached = None
+
+    def do_GET(self):  # noqa: N802
+        path = self.path.split("?")[0]
+        if path == "/graph.json":
+            self.serve_graph()
+        elif path == "/set-theme":
+            self.set_theme()
+        else:
+            src = self.graph_path
+            full = str(src.resolve()) if src.exists() else str(src.absolute())
+            body = render_html({}, live_endpoint="graph.json",
+                               page_title=f"Kgraph - {src.name}",
+                               page_header=f"Knowledge Graph — {full}",
+                               theme=_config_theme())
+            self.send_bytes(body.encode("utf-8"), "text/html; charset=utf-8")
+
+    def serve_graph(self):
+        try:
+            mtime = self.graph_path.stat().st_mtime
+            if mtime != self.last_mtime:
+                entities, relations, incomplete = load_graph(self.graph_path)
+                payload = build_payload(entities, relations)
+                payload["sig"] = payload_signature(payload)
+                payload["updated"] = time.strftime("%H:%M:%S")
+                payload["error"] = "идёт запись в файл..." if incomplete else None
+                self.cached = (mtime, payload)
+                self.last_mtime = mtime
+            send = dict(self.cached[1])
+        except FileNotFoundError:
+            send = {"error": "файл не найден, жду создания...", "updated": "",
+                    "nodes": [], "edges": [], "entityTypes": [], "sig": "empty"}
+        send["theme"] = _config_theme()  # живёт в опросе -> синхронизация темы между окнами
+        self.send_bytes(json.dumps(send, ensure_ascii=False).encode("utf-8"),
+                        "application/json; charset=utf-8")
+
+    def set_theme(self):
+        q = parse_qs(urlparse(self.path).query)
+        theme = "dark" if q.get("dark", ["0"])[0] in ("1", "true", "yes") else "light"
+        _config_set_theme(theme)
+        self.send_bytes(b'{"ok": true}', "application/json; charset=utf-8")
+
+    def send_bytes(self, body, ctype):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):  # keep console clean
+        pass
+
+
+def _run_server(src: Path, port: int, open_browser: bool):
+    if not src.exists():
+        print(f"Предупреждение: файл ещё не существует, жду: {src}")
+    GraphHandler.graph_path = src
+    srv = ThreadingHTTPServer(("127.0.0.1", port), GraphHandler)
+    url = f"http://127.0.0.1:{port}/"
+    print(f"Live-просмотр: {url}")
+    print(f"Источник: {src.resolve() if src.exists() else src} — граф будет обновляться сам при записи в файл")
+    if open_browser:
+        webbrowser.open(url, new=2)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nОстановлено.")
+
+
+def _serve_background(src: Path, port_wanted: int, open_browser: bool):
+    state = _prune(_state_load())
+    abs_src = str(src.resolve()) if src.exists() else str(src.absolute())
+    for k, v in state.items():
+        if v.get("graph") == abs_src and _pid_alive(v.get("pid", -1)):
+            print(f"Уже запущен: {v['url']}  (id: {k})")
+            return
+    port = _pick_port(port_wanted)
+    stem = src.stem if src.stem else "graph"
+    sid = f"{stem}-{port}"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    logf = LOG_DIR / f"{sid}.log"
+    child = [sys.executable, str(Path(__file__).resolve()), "serve", str(src),
+             "--port", str(port), "--no-open", "--daemon-child"]
+    with open(logf, "ab") as lf:
+        popen_kw = {"stdin": subprocess.DEVNULL, "stdout": lf,
+                    "stderr": subprocess.STDOUT, "start_new_session": True}
+        if sys.platform == "win32":
+            popen_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        proc = subprocess.Popen(child, **popen_kw)
+    time.sleep(0.6)
+    if proc.poll() is not None:
+        print(f"Ошибка запуска (код {proc.returncode}). Лог: {logf}")
+        sys.exit(1)
+    state[sid] = {
+        "pid": proc.pid, "port": port, "graph": abs_src,
+        "started": time.strftime("%H:%M:%S"),
+        "url": f"http://127.0.0.1:{port}/",
+    }
+    _state_save(state)
+    print(f"Запущено в фоне: {sid}")  # noqa: E501
+    print(f"  {state[sid]['url']}  (pid {proc.pid}, лог: {logf})")
+    if open_browser:
+        webbrowser.open(state[sid]["url"], new=2)
+
+
+def cmd_serve(args):
+    src = Path(args.graph)
+    if getattr(args, "daemon_child", False):
+        _run_server(src, args.port, open_browser=False)
+        return
+    if getattr(args, "background", False):
+        _serve_background(src, args.port, args.open)
+        return
+    # foreground: strict — if the port is taken, tell the user instead of guessing
+    try:
+        _run_server(src, args.port, args.open)
+    except OSError as e:
+        if "address already in use" in str(e).lower():
+            sys.exit(f"Порт {args.port} занят. Укажите --port или используйте --background (подберёт свободный).")
+        raise
+
+
+# ---------------- LIST / STOP ----------------
+def _cleanup_orphan_logs(state):
+    """Remove log files that no running server references."""
+    try:
+        files = list(LOG_DIR.iterdir())
+    except FileNotFoundError:
+        return
+    for f in files:
+        if f.suffix == ".log" and f.stem not in state:
+            f.unlink(missing_ok=True)
+
+
+def cmd_list(args):
+    state = _prune(_state_load())
+    _state_save(state)
+    _cleanup_orphan_logs(state)
+    servers = {k: v for k, v in state.items() if k != CONFIG_KEY}
+    if not servers:
+        print("Запущенных серверов нет.")
+        return
+    rows = sorted(servers.items(), key=lambda kv: kv[1]["port"])
+    print(f"{'ID':<22}{'PID':>7}{'ПОРТ':>6}  {'ЗАПУЩЕН':<10}  URL")
+    print("-" * 78)
+    for sid, v in rows:
+        print(f"{sid:<22}{v['pid']:>7}{v['port']:>6}  {v.get('started',''):<10}  {v['url']}")
+    print(f"\nВсего: {len(rows)}. Остановить: kgraph stop <id|порт|имя>  или  kgraph stop --all")
+
+
+def _match(state, key):
+    key = key.lower()
+    hits = []
+    for sid, v in state.items():
+        if sid == CONFIG_KEY:
+            continue
+        if (key in sid.lower() or str(v.get("port", "")) == key
+                or key in Path(v.get("graph", "")).name.lower() or key in v.get("graph", "").lower()):
+            hits.append((sid, v))
+    return hits
+
+
+def cmd_stop(args):
+    state = _prune(_state_load())
+    _state_save(state)
+    if getattr(args, "all", False):
+        targets = [(k, v) for k, v in state.items() if k != CONFIG_KEY]
+        if not targets:
+            print("Запущенных серверов нет.")
+            return
+    else:
+        hits = _match(state, args.key)
+        if not hits:
+            print(f"Ничего не найдено по запросу: {args.key}")
+            cmd_list(args)
+            return
+        targets = hits
+    for sid, v in targets:
+        _kill_pid(v["pid"])
+        state.pop(sid, None)
+        _remove_log(sid)
+        print(f"Остановлен: {sid}  {v['url']}")
+    _state_save(state)
+    if getattr(args, "all", False):
+        print(f"Остановлено серверов: {len(targets)}")
+
+
+# ---------------- MAN PAGE ----------------
+MAN_PAGE = r""".TH KGRAPH 1 "2 сентября 2026" "withersky" "Пользовательские команды"
+.SH ИМЯ
+kgraph \- визуализатор knowledge graph из файлов mcp-memory (JSONL)
+.SH СИНОПСИС
+.B kgraph static <graph.jsonl> [-o | --open]
+.br
+.B kgraph serve <graph.jsonl> [-p N | --port N] [-no | --no-open] [-b]
+.br
+.B kgraph list
+.br
+.B kgraph stop <id|порт|имя> | --all
+.br
+.B kgraph man
+.br
+.B kgraph [-v | --version]
+.SH ОПИСАНИЕ
+.PP
+kgraph читает файл графа mcp-memory (JSONL с записями типов entity и relation),
+строит интерактивный граф на vis.js и показывает его в браузере.
+.PP
+Есть два режима показа:
+.TP
+.B static
+Одноразово генерирует файл .html рядом с исходным JSONL. Страница статична;
+тема, выбранная при генерации, «запекается» в файл, дальнейшие переключения
+браузер запоминает в localStorage.
+.TP
+.B serve
+Поднимает локальный HTTP-сервер на 127.0.0.1. Страница сама опрашивает исходный
+файл и обновляется, когда в него пишут; можно держать несколько графов сразу
+(каждый занимает следующий свободный порт, начиная с указанного).
+.SH КОМАНДЫ
+.TP
+.B static <graph.jsonl> [-o | --open]
+Пишет <graph>.html рядом с исходником. -o/--open сразу открывает страницу в браузере.
+Тему для «запекания» берёт из servers.json (см. ТЕМА), по умолчанию светлую.
+.TP
+.B serve <graph.jsonl> [-p N | --port N] [-no | --no-open] [-b]
+Запускает live-режим. По умолчанию работает на переднем плане (Ctrl+C останавливает);
+-b/--background уводит сервер в фон и возвращает управление в терминал.
+-p N задаёт порт (по умолчанию 8765). -no/--no-open запрещает автозапуск браузера.
+.TP
+.B list
+Показывает запущенные фоновые серверы: id, pid, порт, время старта, url. Алиас: ps.
+.TP
+.B stop <id|порт|имя> | --all
+Останавливает сервер по id (например tabula-plugin-8765), по порту или по части
+имени файла графа. --all останавливает все серверы.
+.TP
+.B man
+Показывает эту man-страницу.
+.SH ТЕМА
+.PP
+По умолчанию светлая. В шапке страницы есть переключатель (🌙/☀️).
+.TP
+.B serve
+Тема сохраняется в servers.json (ключ _config.theme) и мгновенно синхронизируется
+между всеми открытыми окнами. Эта же тема станет стартовой для следующей статики.
+.TP
+.B static
+Переключение темы запоминается браузером в localStorage для этой страницы.
+Стартовая тема берётся из servers.json (если файл есть) или светлая.
+.SH ФАЙЛЫ
+.PP
+Состояние хранится в каталоге, зависящем от ОС:
+.TP
+Linux
+$XDG_STATE_HOME/kgraph (по умолчанию ~/.local/state/kgraph)
+.TP
+macOS
+~/Library/Application Support/kgraph
+.TP
+Windows
+%LOCALAPPDATA%/kgraph (по умолчанию ~/AppData/Local/kgraph)
+.PP
+Внутри: servers.json (запущенные серверы + тема) и подкаталог logs/ с логами
+фоновых серверов.
+.SH ПРИМЕРЫ
+.nf
+kgraph static notes.jsonl -o
+kgraph serve notes.jsonl
+kgraph serve notes.jsonl -p 9000 -b
+kgraph serve notes.jsonl -p 9000 --no-open
+kgraph ps
+kgraph stop tabula-plugin-8765
+kgraph stop --all
+.fi
+.SH АВТОР
+.PP
+Автор: withersky. 2026.
+.SH КОД ВОЗВРАТА
+.PP
+0 - успех. 1 - ошибка (файл не найден, порт занят и т.п.).
+"""
+
+
+def _roff_to_text(src):
+    """Падение без man: снимаем макросы roff, оставляя читаемый текст."""
+    out = []
+    for raw in src.splitlines():
+        line = raw.rstrip()
+        if not line or line.startswith('.\\"') or line.startswith('."'):
+            continue
+        if line.startswith('.TH '):
+            out.append(line.split()[1].upper())
+        elif line.startswith('.SH '):
+            title = line[4:].strip().upper()
+            out += ['', title, '=' * len(title)]
+        elif line.startswith('.PP') or line.startswith('.P '):
+            out.append('')
+        elif line.startswith('.TP'):
+            out.append('')
+        elif line.startswith('.B ') or line.startswith('.I '):
+            out.append(line[3:])
+        elif line.startswith(('.nf', '.fi', '.br')):
+            out.append('')
+        else:
+            out.append(line)
+    text = '\n'.join(out)
+    while '\n\n\n' in text:
+        text = text.replace('\n\n\n', '\n\n')
+    return text.strip('\n') + '\n'
+
+
+def cmd_man(args):
+    """kgraph man — показать man-страницу (через man, если он доступен)."""
+    if sys.stdout.isatty() and shutil.which("man"):
+        fd, path = tempfile.mkstemp(suffix=".1", prefix="kgraph-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(MAN_PAGE)
+            try:
+                subprocess.call(["man", path])
+            except OSError:
+                print(_roff_to_text(MAN_PAGE))
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    else:
+        print(_roff_to_text(MAN_PAGE))
+
+
+# ---------------- HTML ----------------
+VIEWER_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>__PAGE_TITLE__</title>
+<style>
+  :root{--bg:#fafbfc;--panel:#fff;--border:#ddd;--input:#ccc;--text:#333;--sub:#555;--muted:#888;--shadow:rgba(0,0,0,.08);}
+  body.dark{--bg:#17181c;--panel:#1e2027;--border:#33363f;--input:#3a3d47;--text:#e6e8ec;--sub:#b6bcc6;--muted:#9aa0ab;--shadow:rgba(0,0,0,.45);}
+  body{margin:0;font-family:system-ui,-apple-system,sans-serif;overflow:hidden;background:var(--bg);color:var(--text);}
+  #top{position:fixed;left:0;right:0;top:0;height:52px;background:var(--panel);border-bottom:1px solid var(--border);
+       display:flex;align-items:center;gap:12px;padding:0 16px;z-index:10;box-shadow:0 1px 3px rgba(0,0,0,.06);}
+  #top h1{font-size:15px;margin:0;color:var(--text);font-weight:600;white-space:nowrap;flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;}
+  #search{flex:0 0 260px;padding:6px 10px;border:1px solid var(--input);border-radius:6px;font-size:13px;background:var(--bg);color:var(--text);}
+  #search::placeholder{color:var(--muted);}
+  #theme-btn{flex:none;width:28px;height:28px;border:1px solid var(--input);background:var(--panel);border-radius:6px;
+             cursor:pointer;font-size:15px;line-height:1;display:flex;align-items:center;justify-content:center;color:var(--text);padding:0;}
+  #theme-btn:hover{background:var(--bg);}
+  #stats{margin-left:auto;color:var(--muted);font-size:12px;white-space:nowrap;}
+  #live{display:none;font-size:12px;white-space:nowrap;}
+  #live .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#999;margin-right:5px;}
+  #live.on .dot{background:#2ecc71;animation:pulse 1.2s infinite;}
+  @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(46,204,113,.5)}50%{box-shadow:0 0 0 5px rgba(46,204,113,0)}}
+  #legend{position:fixed;left:12px;bottom:12px;background:var(--panel);border:1px solid var(--border);border-radius:8px;
+          padding:10px 14px;font-size:12px;z-index:10;box-shadow:0 2px 6px var(--shadow);max-height:45%;overflow:auto;}
+  #legend h4{margin:0 0 6px;font-size:12px;color:var(--sub);cursor:pointer;}
+  #legbody{display:block;}
+  #legend.min .lg{display:none;}
+  .lg{display:flex;align-items:center;gap:6px;margin:2px 0;white-space:nowrap;cursor:pointer;}
+  .sw{width:12px;height:12px;border-radius:50%;flex:none;}
+  .cnt{margin-left:auto;color:var(--muted);font-weight:normal;}
+  #panel{position:fixed;right:12px;bottom:12px;background:var(--panel);border:1px solid var(--border);border-radius:8px;
+         padding:10px 14px;font-size:13px;z-index:10;box-shadow:0 2px 6px var(--shadow);max-width:340px;max-height:40%;overflow:auto;display:none;}
+  #panel b{color:var(--text);}
+  #panel ul{margin:6px 0 0;padding-left:18px;}
+  #network{position:fixed;left:0;right:0;top:52px;bottom:0;}
+</style>
+</head>
+<body__BODY_ATTR__>
+<div id="top">
+  <h1>__PAGE_HEADER__</h1>
+  <span id="live"><span class="dot"></span><span id="livetxt"></span></span>
+  <span id="stats"></span>
+  <button id="theme-btn" title="Тёмная тема"><span id="theme-icon">🌙</span></button>
+  <input id="search" type="text" placeholder="Поиск узла / подсветка соседей...">
+</div>
+<div id="network"></div>
+<div id="legend"><h4 id="lgtitle">Фильтр по типу ▾</h4><div id="legbody"></div></div>
+<div id="panel"></div>
+
+<script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+<script>
+const EMBEDDED = __EMBEDDED__;   // static: full payload object | live: null
+const LIVE_ENDPOINT = "__LIVE_ENDPOINT__"; // e.g. graph.json
+const INITIAL_THEME = __INITIAL_THEME__;   // "light" | "dark" — from server config
+const container = document.getElementById('network');
+
+const options = {
+  nodes: { borderWidth: 1, borderWidthSelected: 3 },
+  edges: { smooth: { type: 'continuous' }, width: 1.5, selectionWidth: 2.5 },
+  physics: { solver: 'forceAtlas2Based', stabilization: { iterations: 300 },
+             forceAtlas2Based: { gravitationalConstant: -60, springLength: 140, springConstant: 0.08 } },
+  interaction: { hover: true, tooltipDelay: 150, navigationButtons: true, keyboard: true },
+  manipulation: { enabled: false }
+};
+
+let allNodes, allEdges, network, lastPayload = null;
+let activeTypes = null;       // null = all, else Set of visible entityTypes
+
+function themeFonts() {
+  return document.body.classList.contains('dark')
+    ? { node: '#e6e8ec', edge: '#d3d8de', stroke: '#1e2027' }
+    : { node: '#343434', edge: '#343434', stroke: '#ffffff' };
+}
+
+function applyData(payload) {
+  lastPayload = payload;
+  if (!activeTypes) activeTypes = new Set(payload.entityTypes);
+  const tf = themeFonts();
+  const nodes = new vis.DataSet(payload.nodes.filter(n => activeTypes.has(n.entityType))
+      .map(n => ({ ...n, font: { ...n.font, color: tf.node } })));
+  const keep = new Set(nodes.getIds());
+  const edges = new vis.DataSet(payload.edges.filter(e => keep.has(e.from) && keep.has(e.to))
+      .map(e => ({ ...e, font: { ...e.font, color: tf.edge, strokeColor: tf.stroke } })));
+  network = new vis.Network(container, { nodes, edges }, options);
+  allNodes = nodes; allEdges = edges;
+  network.on('click', params => { if (params.nodes.length) showPanel(allNodes.get(params.nodes[0])); else hidePanel(); });
+  network.on('deselectNode', hidePanel);
+  updateStats();
+  buildLegend(payload);
+}
+
+function updateStats() {
+  document.getElementById('stats').textContent =
+    (allNodes ? allNodes.length : 0) + ' узлов · ' + (allEdges ? allEdges.length : 0) + ' связей';
+}
+
+function buildLegend(payload) {
+  const body = document.getElementById('legbody');
+  body.innerHTML = '';
+  payload.entityTypes.forEach(t => {
+    const row = document.createElement('div');
+    row.className = 'lg';
+    const sample = payload.nodes.find(n => n.entityType === t);
+    const count = payload.nodes.filter(n => n.entityType === t).length;
+    row.innerHTML = `<span class="sw" style="background:${sample ? sample.color.background : '#999'}"></span>
+                     <span>${t}</span><span class="cnt">${count}</span>`;
+    row.style.opacity = activeTypes.has(t) ? 1 : .35;
+    row.onclick = () => {
+      if (activeTypes.has(t)) { activeTypes.delete(t); row.style.opacity = .35; }
+      else { activeTypes.add(t); row.style.opacity = 1; }
+      applyData({ nodes: payload.nodes, edges: payload.edges, entityTypes: payload.entityTypes });
+    };
+    body.appendChild(row);
+  });
+}
+document.getElementById('lgtitle').onclick = () =>
+  document.getElementById('legend').classList.toggle('min');
+
+function showPanel(n) {
+  const p = document.getElementById('panel');
+  const obs = (n.title || '').split('<br>').filter(Boolean).slice(1);
+  p.innerHTML = `<b>${n.label}</b> <i style="color:#888">(${n.entityType})</i>` +
+    (obs.length ? `<ul>${obs.map(o => '<li>' + o.replace(/^&bull; /, '') + '</li>').join('')}</ul>` : '');
+  p.style.display = 'block';
+}
+function hidePanel() { document.getElementById('panel').style.display = 'none'; }
+
+document.getElementById('search').addEventListener('input', e => {
+  const q = e.target.value.trim().toLowerCase();
+  if (!q) { network.selectNodes([]); network.unselectAll(); return; }
+  const hit = allNodes.get().find(n => n.label.toLowerCase().includes(q));
+  if (!hit) return;
+  const nb = new Set([hit.id]);
+  allEdges.get().forEach(ed => { if (ed.from === hit.id) nb.add(ed.to); if (ed.to === hit.id) nb.add(ed.from); });
+  network.selectNodes([...nb], false);
+});
+window.addEventListener('resize', () => network && network.redraw());
+
+/* ------------ THEME TOGGLE ------------ */
+const themeBtn = document.getElementById('theme-btn');
+const themeIcon = document.getElementById('theme-icon');
+
+function setTheme(dark, persist = true) {
+  document.body.classList.toggle('dark', dark);
+  themeIcon.textContent = dark ? '☀️' : '🌙';
+  themeBtn.title = dark ? 'Светлая тема' : 'Тёмная тема';
+  if (persist) {
+    try {
+      if (EMBEDDED !== null) {           // static: помним тему в этом браузере
+        localStorage.setItem('kgraph-theme', dark ? 'dark' : 'light');
+      } else {                            // live: сохраняем на сервере
+        fetch('/set-theme?dark=' + (dark ? 1 : 0), { cache: 'no-store' });
+      }
+    } catch (e) {}
+  }
+  if (network && lastPayload) applyData(lastPayload);
+}
+themeBtn.addEventListener('click', () => setTheme(!document.body.classList.contains('dark')));
+
+let savedTheme = null;
+try { if (EMBEDDED !== null) savedTheme = localStorage.getItem('kgraph-theme'); } catch (e) {}
+setTheme(savedTheme ? savedTheme === 'dark' : INITIAL_THEME === 'dark', false);
+
+/* ------------ LIVE MODE ------------ */
+let lastSig = '';
+const liveEl = document.getElementById('live');
+const liveTxt = document.getElementById('livetxt');
+
+async function poll() {
+  if (!LIVE_ENDPOINT) return;
+  try {
+    const r = await fetch(LIVE_ENDPOINT + '?ts=' + Date.now(), { cache: 'no-store' });
+    if (!r.ok) { liveTxt.textContent = 'файл не найден'; liveEl.classList.remove('on'); return; }
+    const payload = await r.json();
+    if (payload.error) { liveTxt.textContent = payload.error; liveEl.classList.remove('on'); return; }
+    liveTxt.textContent = 'обновлено ' + payload.updated;
+    if (payload.theme && (payload.theme === 'dark') !== document.body.classList.contains('dark')) {
+      setTheme(payload.theme === 'dark', false); // тему сменили в другом окне/на сервере
+    }
+    if (payload.sig !== lastSig) {
+      lastSig = payload.sig;
+      applyData(payload);
+      liveEl.classList.add('on');
+      setTimeout(() => liveEl.classList.remove('on'), 1500);
+    }
+  } catch (err) { liveTxt.textContent = 'соединение потеряно'; liveEl.classList.remove('on'); }
+}
+
+if (EMBEDDED !== null) {
+  applyData(EMBEDDED);
+} else {
+  liveEl.style.display = 'inline';
+  poll();
+  setInterval(poll, 1500);
+}
+</script>
+</body>
+</html>
+"""
+
+
+def render_html(payload, live_endpoint=None, page_title="Knowledge Graph", page_header="Knowledge Graph", theme="light"):
+    doc = VIEWER_HTML.replace("__EMBEDDED__",
+                              "null" if live_endpoint else json.dumps(payload, ensure_ascii=False))
+    doc = doc.replace("__LIVE_ENDPOINT__", live_endpoint or "")
+    doc = doc.replace("__PAGE_TITLE__", html.escape(page_title))
+    doc = doc.replace("__PAGE_HEADER__", html.escape(page_header))
+    doc = doc.replace("__BODY_ATTR__", ' class="dark"' if theme == "dark" else "")
+    doc = doc.replace("__INITIAL_THEME__", json.dumps(theme))
+    return doc
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Визуализация knowledge graph из mcp-memory JSONL")
+    ap.add_argument("-v", "--version", action="store_true", help="показать версию и автора")
+    sub = ap.add_subparsers(dest="cmd")
+
+    p_static = sub.add_parser("static", help="сгенерировать статичный .html рядом с jsonl")
+    p_static.add_argument("graph", help="путь к .jsonl")
+    p_static.add_argument("-o", "--open", action="store_true", help="открыть в браузере")
+    p_static.set_defaults(func=cmd_static)
+
+    p_serve = sub.add_parser("serve", help="режим реального времени (HTTP + авто-обновление)")
+    p_serve.add_argument("graph", help="путь к .jsonl")
+    p_serve.add_argument("-p", "--port", type=int, default=8765)
+    p_serve.add_argument("-no", "--no-open", action="store_true", help="не открывать браузер автоматически")
+    p_serve.add_argument("-b", "--background", action="store_true",
+                         help="запустить в фоне (несколько графов — каждый получит свободный порт)")
+    p_serve.add_argument("--daemon-child", action="store_true", help=argparse.SUPPRESS)
+    p_serve.set_defaults(func=cmd_serve)
+
+    sub.add_parser("list", aliases=["ps"], help="показать запущенные серверы").set_defaults(
+        func=cmd_list)
+
+    p_stop = sub.add_parser("stop", help="остановить сервер по id/порту/имени графа")
+    p_stop.add_argument("key", nargs="?", help="id, порт или часть имени файла графа")
+    p_stop.add_argument("--all", "-a", action="store_true", help="остановить все")
+    p_stop.set_defaults(func=cmd_stop)
+
+    sub.add_parser("man", help="показать man-страницу").set_defaults(func=cmd_man)
+
+    # backward compat: `kgraph <file.jsonl>` == static
+    if len(sys.argv) > 1 and not sys.argv[1].startswith("-") and \
+            sys.argv[1] not in ("static", "serve", "list", "ps", "stop", "man"):
+        sys.argv.insert(1, "static")
+
+    args = ap.parse_args()
+    if args.version:
+        print("kgraph 1.0 — визуализатор knowledge graph (mcp-memory JSONL)")
+        print("Автор: withersky")
+        sys.exit(0)
+    if not getattr(args, "func", None):
+        ap.print_help()
+        sys.exit(1)
+    args.open = not getattr(args, "no_open", False)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
