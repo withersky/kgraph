@@ -18,6 +18,7 @@
 """Knowledge graph (mcp-memory JSONL) -> interactive HTML visualizer.
 
 Static : kgraph static <graph.jsonl> [-o | --open]     -> writes <graph>.html next to source.
+Obsidian: kgraph obsidian <graph.jsonl> [-o DIR | --out DIR] -> export graph to Obsidian Markdown notes (YAML + [[wiki-links]]).
 Serve  : kgraph serve <graph.jsonl> [-p N | --port N] [-no | --no-open] [-b]   live HTTP view, page auto-updates.
          -b / --background   run as a daemon; several graphs may run at once
                               (each takes the next free port starting from --port).
@@ -261,6 +262,79 @@ def cmd_static(args):
         webbrowser.open(out.resolve().as_uri())
 
 
+# ---------------- OBSIDIAN MODE ----------------
+def _safe_name(name):
+    """Имя сущности -> имя .md-файла, безопасное для любой ФС и Obsidian."""
+    clean = "".join("_" if ch in '<>:"/\\|?*' or ord(ch) < 32 else ch for ch in name)
+    clean = clean.strip().rstrip(".").strip()
+    return clean or "note"
+
+
+def _yaml_scalar(s):
+    """Строка как валидный YAML-скаляр (JSON-квотинг: JSON — подмножество YAML)."""
+    return json.dumps(s, ensure_ascii=False)
+
+
+def cmd_obsidian(args):
+    """kgraph obsidian — экспорт графа в заметки Obsidian (Markdown + YAML + [[ссылки]])."""
+    src = Path(args.graph)
+    if not src.exists():
+        sys.exit(f"Файл не найден: {src}")
+    entities, relations, incomplete = load_graph(src)
+    out_dir = Path(args.out) if args.out else src.with_name(src.stem + ".obsidian")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Файловые имена: безопасный вариант + оригинальное имя (для алиасов в YAML).
+    fnames, used = {}, set()
+    for e in entities:
+        base = _safe_name(e["name"])
+        fname, i = base, 1
+        while fname in used:
+            i += 1
+            fname = f"{base}_{i}"
+        used.add(fname)
+        fnames[e["name"]] = fname
+
+    outgoing, incoming = {}, {}
+    for r in relations:
+        lbl = r.get("relationType") or "связь"
+        outgoing.setdefault(r.get("from"), []).append((r.get("to"), lbl))
+        incoming.setdefault(r.get("to"), []).append((r.get("from"), lbl))
+
+    for e in entities:
+        name, fname = e["name"], fnames[e["name"]]
+        etype = e.get("entityType") or "other"
+        lines = ["---",
+                 f"type: {_yaml_scalar(etype)}",
+                 f"tags: [{_yaml_scalar(etype)}]"]
+        if fname != name:
+            lines.append(f"aliases: [{_yaml_scalar(name)}]")
+        lines += ["---", "", f"# {name}"]
+
+        obs = [o for o in e.get("observations", []) if isinstance(o, str) and o]
+        if obs:
+            lines += ["", "## Заметки"]
+            lines += [f"- {o}" for o in obs]
+
+        outs, ins = outgoing.get(name, []), incoming.get(name, [])
+        if outs or ins:
+            lines.append("")
+            lines.append("## Связи")
+            if outs:
+                lines += ["### Исходящие"]
+                lines += [f"- [[{t}]] — {lbl}" for t, lbl in outs]
+            if ins:
+                lines += ["### Входящие"]
+                lines += [f"- [[{f}]] — {lbl}" for f, lbl in ins]
+
+        lines += ["", f"> Источник: `{src}`", ""]
+        (out_dir / f"{fname}.md").write_text("\n".join(lines), encoding="utf-8")
+
+    note = " (файл дописывается — данные могут быть неполными)" if incomplete else ""
+    print(f"OK: {out_dir}  ({len(entities)} entities, {len(relations)} relations, "
+          f"{len(fnames)} md-файлов{note})")
+
+
 # ---------------- LIVE MODE ----------------
 class GraphHandler(BaseHTTPRequestHandler):
     graph_path = None
@@ -460,6 +534,8 @@ kgraph \- визуализатор knowledge graph из файлов mcp-memory 
 .SH СИНОПСИС
 .B kgraph static <graph.jsonl> [-o | --open]
 .br
+.B kgraph obsidian <graph.jsonl> [-o DIR | --out DIR]
+.br
 .B kgraph serve <graph.jsonl> [-p N | --port N] [-no | --no-open] [-b]
 .br
 .B kgraph list
@@ -490,6 +566,12 @@ kgraph читает файл графа mcp-memory (JSONL с записями т
 .B static <graph.jsonl> [-o | --open]
 Пишет <graph>.html рядом с исходником. -o/--open сразу открывает страницу в браузере.
 Тему для «запекания» берёт из servers.json (см. ТЕМА), по умолчанию светлую.
+.TP
+.B obsidian <graph.jsonl> [-o DIR | --out DIR]
+Экспортирует граф в набор Markdown-заметок для Obsidian: каждая сущность — один
+файл с YAML-метаданными (type, tags, aliases) и вики-ссылками [[...]] в разделах
+«Исходящие» / «Входящие».
+Каталог по умолчанию: <graph>.obsidian рядом с исходником.
 .TP
 .B serve <graph.jsonl> [-p N | --port N] [-no | --no-open] [-b]
 Запускает live-режим. По умолчанию работает на переднем плане (Ctrl+C останавливает);
@@ -534,6 +616,8 @@ Windows
 .SH ПРИМЕРЫ
 .nf
 kgraph static notes.jsonl -o
+kgraph obsidian notes.jsonl
+kgraph obsidian notes.jsonl -o ~/Notes/KGraph
 kgraph serve notes.jsonl
 kgraph serve notes.jsonl -p 9000 -b
 kgraph serve notes.jsonl -p 9000 --no-open
@@ -838,16 +922,22 @@ def main():
     p_stop.add_argument("--all", "-a", action="store_true", help="остановить все")
     p_stop.set_defaults(func=cmd_stop)
 
+    p_obsidian = sub.add_parser("obsidian",
+                                help="экспорт графа в заметки Obsidian (Markdown + YAML + [[ссылки]])")
+    p_obsidian.add_argument("graph", help="путь к .jsonl")
+    p_obsidian.add_argument("-o", "--out", help="каталог для .md (по умолчанию <graph>.obsidian рядом с исходником)")
+    p_obsidian.set_defaults(func=cmd_obsidian)
+
     sub.add_parser("man", help="показать man-страницу").set_defaults(func=cmd_man)
 
     # backward compat: `kgraph <file.jsonl>` == static
     if len(sys.argv) > 1 and not sys.argv[1].startswith("-") and \
-            sys.argv[1] not in ("static", "serve", "list", "ps", "stop", "man"):
+            sys.argv[1] not in ("static", "serve", "list", "ps", "stop", "man", "obsidian"):
         sys.argv.insert(1, "static")
 
     args = ap.parse_args()
     if args.version:
-        print("kgraph 1.0 — визуализатор knowledge graph (mcp-memory JSONL)")
+        print("kgraph 1.1 — визуализатор knowledge graph (mcp-memory JSONL)")
         print("Автор: withersky")
         sys.exit(0)
     if not getattr(args, "func", None):
