@@ -19,7 +19,7 @@
 
 Static : kgraph static <graph.jsonl> [-o | --open]     -> writes <graph>.html next to source.
 Obsidian: kgraph obsidian <graph.jsonl> [-o DIR | --out DIR] -> export graph to Obsidian Markdown notes (YAML + [[wiki-links]]).
-Serve  : kgraph serve <graph.jsonl> [-p N | --port N] [-no | --no-open] [-b]   live HTTP view, page auto-updates.
+Serve  : kgraph serve <graph.jsonl> [-p N | --port N] [--host H] [-no | --no-open] [-b]   live HTTP view, page auto-updates.
          -b / --background   run as a daemon; several graphs may run at once
                               (each takes the next free port starting from --port).
 List   : kgraph list (alias: ps)                  -> show running background servers.
@@ -218,15 +218,29 @@ def _prune(state):
     return state
 
 
-def _pick_port(wanted):
+def _pick_port(wanted, host="127.0.0.1"):
     for port in range(wanted, wanted + 200):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
-                s.bind(("127.0.0.1", port))
+                s.bind((host, port))
                 return port
             except OSError:
                 continue
     sys.exit("Не нашёл свободного порта")
+
+
+def _lan_ip():
+    """Лучший предполагаемый не-loopback IPv4-адрес (для подсказок при --host 0.0.0.0)."""
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))  # без реальной отправки — просто резолвит исходящий интерфейс
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        if s is not None:
+            s.close()
 
 
 def _kill_pid(pid):
@@ -393,13 +407,16 @@ class GraphHandler(BaseHTTPRequestHandler):
         pass
 
 
-def _run_server(src: Path, port: int, open_browser: bool):
+def _run_server(src: Path, port: int, open_browser: bool, host="127.0.0.1"):
     if not src.exists():
         print(f"Предупреждение: файл ещё не существует, жду: {src}")
     GraphHandler.graph_path = src
-    srv = ThreadingHTTPServer(("127.0.0.1", port), GraphHandler)
-    url = f"http://127.0.0.1:{port}/"
+    srv = ThreadingHTTPServer((host, port), GraphHandler)
+    url = f"http://{host}:{port}/"
     print(f"Live-просмотр: {url}")
+    if host in ("0.0.0.0", ""):
+        lan = _lan_ip()
+        print(f"Доступно со всех интерфейсов — с других машин подсети: http://{lan or '<ваш-IP>'}:{port}/")
     print(f"Источник: {src.resolve() if src.exists() else src} — граф будет обновляться сам при записи в файл")
     if open_browser:
         webbrowser.open(url, new=2)
@@ -409,20 +426,20 @@ def _run_server(src: Path, port: int, open_browser: bool):
         print("\nОстановлено.")
 
 
-def _serve_background(src: Path, port_wanted: int, open_browser: bool):
+def _serve_background(src: Path, port_wanted: int, open_browser: bool, host="127.0.0.1"):
     state = _prune(_state_load())
     abs_src = str(src.resolve()) if src.exists() else str(src.absolute())
     for k, v in state.items():
         if v.get("graph") == abs_src and _pid_alive(v.get("pid", -1)):
             print(f"Уже запущен: {v['url']}  (id: {k})")
             return
-    port = _pick_port(port_wanted)
+    port = _pick_port(port_wanted, host)
     stem = src.stem if src.stem else "graph"
     sid = f"{stem}-{port}"
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logf = LOG_DIR / f"{sid}.log"
     child = [sys.executable, str(Path(__file__).resolve()), "serve", str(src),
-             "--port", str(port), "--no-open", "--daemon-child"]
+             "--port", str(port), "--host", host, "--no-open", "--daemon-child"]
     with open(logf, "ab") as lf:
         popen_kw = {"stdin": subprocess.DEVNULL, "stdout": lf,
                     "stderr": subprocess.STDOUT, "start_new_session": True}
@@ -434,9 +451,9 @@ def _serve_background(src: Path, port_wanted: int, open_browser: bool):
         print(f"Ошибка запуска (код {proc.returncode}). Лог: {logf}")
         sys.exit(1)
     state[sid] = {
-        "pid": proc.pid, "port": port, "graph": abs_src,
+        "pid": proc.pid, "port": port, "graph": abs_src, "host": host,
         "started": time.strftime("%H:%M:%S"),
-        "url": f"http://127.0.0.1:{port}/",
+        "url": f"http://{host}:{port}/",
     }
     _state_save(state)
     print(f"Запущено в фоне: {sid}")  # noqa: E501
@@ -447,15 +464,16 @@ def _serve_background(src: Path, port_wanted: int, open_browser: bool):
 
 def cmd_serve(args):
     src = Path(args.graph)
+    host = getattr(args, "host", "127.0.0.1")
     if getattr(args, "daemon_child", False):
-        _run_server(src, args.port, open_browser=False)
+        _run_server(src, args.port, open_browser=False, host=host)
         return
     if getattr(args, "background", False):
-        _serve_background(src, args.port, args.open)
+        _serve_background(src, args.port, args.open, host=host)
         return
     # foreground: strict — if the port is taken, tell the user instead of guessing
     try:
-        _run_server(src, args.port, args.open)
+        _run_server(src, args.port, args.open, host=host)
     except OSError as e:
         if "address already in use" in str(e).lower():
             sys.exit(f"Порт {args.port} занят. Укажите --port или используйте --background (подберёт свободный).")
@@ -536,7 +554,7 @@ kgraph \- визуализатор knowledge graph из файлов mcp-memory 
 .br
 .B kgraph obsidian <graph.jsonl> [-o DIR | --out DIR]
 .br
-.B kgraph serve <graph.jsonl> [-p N | --port N] [-no | --no-open] [-b]
+.B kgraph serve <graph.jsonl> [-p N | --port N] [--host H] [-no | --no-open] [-b]
 .br
 .B kgraph list
 .br
@@ -573,10 +591,12 @@ kgraph читает файл графа mcp-memory (JSONL с записями т
 «Исходящие» / «Входящие».
 Каталог по умолчанию: <graph>.obsidian рядом с исходником.
 .TP
-.B serve <graph.jsonl> [-p N | --port N] [-no | --no-open] [-b]
+.B serve <graph.jsonl> [-p N | --port N] [--host H] [-no | --no-open] [-b]
 Запускает live-режим. По умолчанию работает на переднем плане (Ctrl+C останавливает);
 -b/--background уводит сервер в фон и возвращает управление в терминал.
 -p N задаёт порт (по умолчанию 8765). -no/--no-open запрещает автозапуск браузера.
+--host H задаёт адрес привязки: 127.0.0.1 (по умолчанию) — только локально,
+а 0.0.0.0 — доступ со всех сетевых интерфейсов (в том числе с других машин подсети).
 .TP
 .B list
 Показывает запущенные фоновые серверы: id, pid, порт, время старта, url. Алиас: ps.
@@ -908,6 +928,8 @@ def main():
     p_serve = sub.add_parser("serve", help="режим реального времени (HTTP + авто-обновление)")
     p_serve.add_argument("graph", help="путь к .jsonl")
     p_serve.add_argument("-p", "--port", type=int, default=8765)
+    p_serve.add_argument("--host", default="127.0.0.1",
+                         help="адрес привязки: 127.0.0.1 — только локально; 0.0.0.0 — со всех интерфейсов подсети")
     p_serve.add_argument("-no", "--no-open", action="store_true", help="не открывать браузер автоматически")
     p_serve.add_argument("-b", "--background", action="store_true",
                          help="запустить в фоне (несколько графов — каждый получит свободный порт)")
@@ -937,7 +959,7 @@ def main():
 
     args = ap.parse_args()
     if args.version:
-        print("kgraph 1.1 — визуализатор knowledge graph (mcp-memory JSONL)")
+        print("kgraph 1.2 — визуализатор knowledge graph (mcp-memory JSONL)")
         print("Автор: withersky")
         sys.exit(0)
     if not getattr(args, "func", None):
