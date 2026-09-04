@@ -19,6 +19,7 @@
 
 Static : kgraph static <graph.jsonl> [-o | --open]     -> writes <graph>.html next to source.
 Obsidian: kgraph obsidian <graph.jsonl> [-o DIR | --out DIR] -> export graph to Obsidian Markdown notes (YAML + [[wiki-links]]).
+Drawio  : kgraph drawio <graph.jsonl> [-o FILE | --out FILE] -> export graph to draw.io (.drawio / mxGraph XML).
 Serve  : kgraph serve <graph.jsonl> [-p N | --port N] [--host H] [-no | --no-open] [-b]   live HTTP view, page auto-updates.
          -b / --background   run as a daemon; several graphs may run at once
                               (each takes the next free port starting from --port).
@@ -32,6 +33,8 @@ import argparse
 import hashlib
 import html
 import json
+import math
+import random
 import os
 import shutil
 import signal
@@ -349,6 +352,195 @@ def cmd_obsidian(args):
           f"{len(fnames)} md-файлов{note})")
 
 
+# ---------------- DRAWIO MODE ----------------
+def _drawio_escape(s):
+    """Экранировать спецсимволы для значения/подписи в XML-атрибуте draw.io."""
+    return html.escape(str(s), quote=True)
+
+
+def _drawio_layout(nodes, rels):
+    """Раскладка без сторонних библиотек (Fruchterman-Reingold, детерминировано).
+
+    Связанные узлы раскладываются силовым алгоритмом: связанные притягиваются,
+    несвязные — отталкиваются, поэтому рёбра почти не пересекают чужие узлы, а
+    сами узлы не перекрываются. Полностью изолированные (без связей) узлы
+    выносятся в отдельную полосу снизу.
+    Возвращает list[(x, y)] в порядке nodes.
+    """
+    NODE_H = 60
+    SEP = 100
+
+    names = [n.get("name") for n in nodes]
+    nidx = {nm: i for i, nm in enumerate(names)}
+    deg = Counter()
+    edges = []
+    for r in rels:
+        a, b = r.get("from"), r.get("to")
+        if a in nidx and b in nidx:
+            edges.append((nidx[a], nidx[b]))
+            deg[a] += 1
+            deg[b] += 1
+
+    connected = [i for i in range(len(nodes)) if deg[names[i]] > 0]
+    isolated = [i for i in range(len(nodes)) if deg[names[i]] == 0]
+
+    pos = [(0, 0)] * len(nodes)
+
+    # --- связанная часть: Fruchterman-Reingold ---
+    if connected:
+        local = {orig: k for k, orig in enumerate(connected)}
+        m = len(connected)
+        ledges = [(local[a], local[b]) for a, b in edges]
+
+        rng = random.Random(42)
+        cols = max(1, int(math.ceil(math.sqrt(m))))
+        xy = [[(k % cols) * 1.0, (k // cols) * 1.0] for k in range(m)]
+        k = math.sqrt(cols * cols / m) if m > 0 else 1.0
+        temp = 0.5
+        for _ in range(300):
+            disp = [[0.0, 0.0] for _ in range(m)]
+            for u in range(m):
+                for v in range(m):
+                    if u == v:
+                        continue
+                    dx = xy[u][0] - xy[v][0]
+                    dy = xy[u][1] - xy[v][1]
+                    d2 = dx * dx + dy * dy
+                    if d2 < 1e-9:
+                        dx = rng.random() - 0.5
+                        dy = rng.random() - 0.5
+                        d2 = dx * dx + dy * dy
+                    d = math.sqrt(d2)
+                    f = (k * k) / d
+                    disp[u][0] += dx / d * f
+                    disp[u][1] += dy / d * f
+            for u, v in ledges:
+                dx = xy[u][0] - xy[v][0]
+                dy = xy[u][1] - xy[v][1]
+                d = math.sqrt(dx * dx + dy * dy) or 1e-9
+                f = (d * d) / k
+                fx = dx / d * f
+                fy = dy / d * f
+                disp[u][0] -= fx
+                disp[u][1] -= fy
+                disp[v][0] += fx
+                disp[v][1] += fy
+            for u in range(m):
+                dd = math.sqrt(disp[u][0] ** 2 + disp[u][1] ** 2) or 1e-9
+                lim = temp if dd > temp else dd
+                xy[u][0] += disp[u][0] / dd * lim
+                xy[u][1] += disp[u][1] / dd * lim
+            temp *= 0.95
+
+        # нормализация: масштаб по минимальному расстоянию, чтобы узлы не перекрывались
+        xs = [p[0] for p in xy]
+        ys = [p[1] for p in xy]
+        minx, maxx = min(xs), max(xs)
+        miny, maxy = min(ys), max(ys)
+        w = (maxx - minx) or 1.0
+        h = (maxy - miny) or 1.0
+        min_d = min(math.hypot(xy[u][0] - xy[v][0], xy[u][1] - xy[v][1])
+                    for u in range(m) for v in range(u + 1, m)) if m > 1 else 1.0
+        min_d = min_d or 1.0
+        scale = 180.0 / min_d
+        for lk, orig in enumerate(connected):
+            pos[orig] = (40 + (xy[lk][0] - minx) * scale,
+                         40 + (xy[lk][1] - miny) * scale)
+        bottom = 40 + h * scale + NODE_H
+    else:
+        bottom = 40
+
+    # --- изолированные узлы: отдельная полоса снизу ---
+    if isolated:
+        cols = max(1, int(math.ceil(math.sqrt(len(isolated)))))
+        base_y = (bottom + SEP) if connected else 40
+        for k, i in enumerate(isolated):
+            col, row = k % cols, k // cols
+            pos[i] = (40 + col * 220, base_y + row * 120)
+
+    return pos
+
+
+def _build_drawio_xml(nodes, positions, type_colors, relations, names):
+    """Собрать draw.io-совместимый mxGraphModel-XML."""
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<mxGraphModel dx="800" dy="600" grid="1" gridSize="10" guides="1" '
+        'tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" '
+        'pageWidth="850" pageHeight="1100" math="0" shadow="0">',
+        '  <root>',
+        '    <mxCell id="0"/>',
+        '    <mxCell id="1" parent="0"/>',
+    ]
+
+    for i, e in enumerate(nodes):
+        name = e.get("name", f"node{i}")
+        cid = f"n{i + 2}"  # 0 и 1 зарезервированы под корень/слой
+        names[name] = cid
+        x, y = positions[i]
+        color = type_colors.get(e.get("entityType", "other"), PALETTE[0])
+        style = (f"rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;"
+                 f"strokeColor={color};fontColor=#1f2937;")
+        parts = [name]  # экранируем один раз в конце: иначе & в name станет &amp;amp;
+        etype = e.get("entityType")
+        if etype:
+            parts.append("<br><font color='" + color + "'>[" + etype + "]</font>")
+        label = html.escape("".join(parts))
+        lines.append(f'    <mxCell id="{cid}" value="{label}" style="{style}" '
+                     f'vertex="1" parent="1">')  # noqa: E501
+        lines.append('      <mxGeometry x="%d" y="%d" width="160" height="60" as="geometry"/>'
+                     % (x, y))
+        lines.append('    </mxCell>')
+
+    for i, r in enumerate(relations):
+        s, t = names.get(r.get("from")), names.get(r.get("to"))
+        if not s or not t:
+            continue  # ссылается на несуществующий узел — пропускаем
+        lbl = _drawio_escape(r.get("relationType") or "связь")
+        style = "edgeStyle=none;rounded=0;html=1;endArrow=block;fontSize=11;labelBackgroundColor=#ffffff;"
+        lines.append(f'    <mxCell id="e{i + 2}" value="{lbl}" style="{style}" '
+                     f'edge="1" parent="1" source="{s}" target="{t}">')  # noqa: E501
+        lines.append('      <mxGeometry relative="1" as="geometry"/>')
+        lines.append('    </mxCell>')
+
+    lines += ['  </root>', '</mxGraphModel>']
+    return "\n".join(lines) + "\n"
+
+
+def cmd_drawio(args):
+    """kgraph drawio — экспорт графа в файл draw.io (.drawio / mxGraph XML)."""
+    src = Path(args.graph)
+    if not src.exists():
+        sys.exit(f"Файл не найден: {src}")
+    entities, relations, incomplete = load_graph(src)
+
+    # Явные entity + «призраки» из relation (если ссылаются на отсутствующих).
+    known = {e["name"] for e in entities}
+    ghost = [{"name": nm, "entityType": "other"} for nm in
+             ({r.get("from") for r in relations} | {r.get("to") for r in relations})
+             - known]
+    nodes = entities + ghost
+
+    # Цвета по типу — как в build_payload.
+    type_colors = {}
+    for i, t in enumerate(dict.fromkeys(e.get("entityType", "other") for e in nodes)):
+        type_colors[t] = PALETTE[i % len(PALETTE)]
+
+    positions = _drawio_layout(nodes, relations)
+    names = {}
+    xml = _build_drawio_xml(nodes, positions, type_colors, relations, names)
+
+    dest = Path(args.out) if args.out else src.with_name(src.stem + ".drawio")
+    if dest.is_dir():
+        dest = dest / (src.stem + ".drawio")
+    dest.write_text(xml, encoding="utf-8")
+
+    note = " (исходник дописывался — данные могут быть неполными)" if incomplete else ""
+    ghost_msg = f", +{len(ghost)} призрачных узлов" if ghost else ""
+    print(f"OK: {dest}  ({len(entities)} entities, {len(relations)} relations"
+          f"{ghost_msg}{note})")
+
+
 # ---------------- LIVE MODE ----------------
 class GraphHandler(BaseHTTPRequestHandler):
     graph_path = None
@@ -554,6 +746,8 @@ kgraph \- визуализатор knowledge graph из файлов mcp-memory 
 .br
 .B kgraph obsidian <graph.jsonl> [-o DIR | --out DIR]
 .br
+.B kgraph drawio <graph.jsonl> [-o FILE | --out FILE]
+.br
 .B kgraph serve <graph.jsonl> [-p N | --port N] [--host H] [-no | --no-open] [-b]
 .br
 .B kgraph list
@@ -590,6 +784,15 @@ kgraph читает файл графа mcp-memory (JSONL с записями т
 файл с YAML-метаданными (type, tags, aliases) и вики-ссылками [[...]] в разделах
 «Исходящие» / «Входящие».
 Каталог по умолчанию: <graph>.obsidian рядом с исходником.
+.TP
+.B drawio <graph.jsonl> [-o FILE | --out FILE]
+Экспортирует граф в один файл draw.io (.drawio, формат mxGraph XML) — открывается
+в diagrams.net. Раскладка узлов — силовая (Fruchterman–Reingold): связанные узлы
+группируются рядом, изолированные (без связей) выносятся отдельной полосой снизу.
+Узлы раскрашены по entityType, по связям идут стрелки с подписью
+relationType. Сущности, на которые ссылаются связи, но которых нет в файле, попадают
+в граф как «призрачные» узлы (тип other).
+Файл по умолчанию: <graph>.drawio рядом с исходником.
 .TP
 .B serve <graph.jsonl> [-p N | --port N] [--host H] [-no | --no-open] [-b]
 Запускает live-режим. По умолчанию работает на переднем плане (Ctrl+C останавливает);
@@ -638,6 +841,8 @@ Windows
 kgraph static notes.jsonl -o
 kgraph obsidian notes.jsonl
 kgraph obsidian notes.jsonl -o ~/Notes/KGraph
+kgraph drawio notes.jsonl
+kgraph drawio notes.jsonl -o diagram.drawio
 kgraph serve notes.jsonl
 kgraph serve notes.jsonl -p 9000 -b
 kgraph serve notes.jsonl -p 9000 --no-open
@@ -950,16 +1155,22 @@ def main():
     p_obsidian.add_argument("-o", "--out", help="каталог для .md (по умолчанию <graph>.obsidian рядом с исходником)")
     p_obsidian.set_defaults(func=cmd_obsidian)
 
+    p_drawio = sub.add_parser("drawio",
+                              help="экспорт графа в draw.io (.drawio / mxGraph XML)")
+    p_drawio.add_argument("graph", help="путь к .jsonl")
+    p_drawio.add_argument("-o", "--out", help="путь к .drawio-файлу (по умолчанию <graph>.drawio рядом с исходником)")
+    p_drawio.set_defaults(func=cmd_drawio)
+
     sub.add_parser("man", help="показать man-страницу").set_defaults(func=cmd_man)
 
     # backward compat: `kgraph <file.jsonl>` == static
     if len(sys.argv) > 1 and not sys.argv[1].startswith("-") and \
-            sys.argv[1] not in ("static", "serve", "list", "ps", "stop", "man", "obsidian"):
+            sys.argv[1] not in ("static", "serve", "list", "ps", "stop", "man", "obsidian", "drawio"):
         sys.argv.insert(1, "static")
 
     args = ap.parse_args()
     if args.version:
-        print("kgraph 1.2 — визуализатор knowledge graph (mcp-memory JSONL)")
+        print("kgraph 1.3 — визуализатор knowledge graph (mcp-memory JSONL)")
         print("Автор: withersky")
         sys.exit(0)
     if not getattr(args, "func", None):
